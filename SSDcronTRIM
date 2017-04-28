@@ -1,51 +1,26 @@
-#!/bin/bash
-version="1.06"
+#! /usr/bin/env bash
+version="2.0.0"
 
 ###########################################################################
-#
-# Program: SSDcronTRIM
-# Author:  Matthias Egger <m.egger@matse.ch>
-# Purpose: intelligent cron job script which automatically
-#          decides how often to trim one or more SSD partitions.
-# History:
-#	   1.06 - 2017-07-24 - Using chmod --reference seemed to be a good
-#                              quick fix. But when it comes to "renew" the
-#                              cronjobs it took itself (with 600 perms) as
-#                              reference. Therefore we hardcode now the 740 
-#                              permissions which should finally fix all
-#                              permission problems. Also corrected a typo.
-#          1.05 - 2016-06-08 - Adding mktemp in the last version led to
-#                              cronjobs with 0600 permissions. Therefore
-#                              they were never executed :-( Thanks to
-#                              Christian Dysthe for bringing it to my
-#                              attention!
-#          1.04 - 2016-02-26 - Multiple changes made:
-#                              * Insecure usage of temporary files changed.
-#                                Thanks to carnil for pointing that out!
-#                              * Added History of changes into the script.
-#                              * find_tool function errors did not exit the
-#                                program and instead led to strange outputs.
-#          1.03 - 2015-05-03 - Bumping the version check so it captures
-#                              Kernels 3.0+ 
-#          1.02 - 2014-03-28 - Typo prevented Trimming between 50% and 59%
-#                              Usage. Thanks goes to Diego Coste.
-#          1.01 - 2014-03-21 - Missed whitespaces while checking the
-#                              partition usage. Found by mastropos.
-#          1.00 - 2014-02-22 - Initial Release
-# License:
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License as published by
-#    the Free Software Foundation, either version 3 of the License, or
-#    (at your option) any later version.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
+# Program: SSDcronTRIM                                                    #
+# Author:  Matthias Egger <m.egger@matse.ch>                              #
+# Purpose: intelligent cron job script which automatically                #
+#          decides how often to trim one or more SSD partitions.          #
+# History: See CHANGELOG.md                                               #
+# License:                                                                #
+#    This program is free software: you can redistribute it and/or modify #
+#    it under the terms of the GNU General Public License as published by #
+#    the Free Software Foundation, either version 3 of the License, or    #
+#    (at your option) any later version.                                  #
+#                                                                         #
+#    This program is distributed in the hope that it will be useful,      #
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of       #
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the        #
+#    GNU General Public License for more details.                         #
+#                                                                         #
+#    You should have received a copy of the GNU General Public License    #
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.#
+#                                                                         #
 ###########################################################################
 
 
@@ -56,160 +31,74 @@ version="1.06"
 # SSD. You can add more SSD mount points, separated by spaces. Make sure
 # all mount points are within the quotes. For example:
 # SSD_MOUNT_POINTS="/ /home /media/my_other_ssd"
-SSD_MOUNT_POINTS="/"
+mount_points="/"
 
-# This script will by default generate a man page and install it into your
-# man page folder. Even if that does not interfere with your distribution,
-# you might dislike this behaviour. In that case set MAN_PAGE_INSTALL to
-# false to prevent an installation. By the way, the manual can be viewed
-# with: man SSDcronTRIM
-MAN_PAGE_INSTALL="true"
-
-# By default this script checks with the hdparm program if the given mount
-# point does support trimming. If this system has no hdparm program
-# installed, if you can't or don't want to install hdparm at all AND if
-# you still know the given partitions support trimming, then you can set
-# HDPARM_CHECKS to false.
-HDPARM_CHECKS="true"
-
-# If we can't use the /etc/cron.{monthly,weekly,daily,hourly} directories to
-# install the cronjob, we need some local place. By default we put the crons
-# into the /etc/cron.d directory. This should be available on any system which
-# has a cron daemon running. If not, define a folder here.
-CRONTAB_DIR="/etc/cron.d"
-
-# Normally you do not have to modify the TRIMMABLE_FS variable. It contains
+# Normally you do not have to modify the trimmable_fs variable. It contains
 # a list of available filesystems which are known to support the FITRIM call.
 # The list is created by searching for FITRIM in the kernel sources.
 #
 # cd /usr/src/linux
 # grep -lr FITRIM fs/ | cut -d/ -f2 | sort | uniq | xargs echo
-TRIMMABLE_FS="btrfs,ecryptfs,ext3,ext4,f2fs,gfs2,jfs,nilfs2,ocfs2,xfs"
+trimmable_fs=("btrfs" "ecryptfs" "ext3" "ext4""f2fs" "gfs2" "jfs" "nilfs2"
+    "ocfs2" "xfs")
 
 
 
 ##### [ F U N C T I O N S ] ###############################################
 
-init_check () {
-	# init_check does some initial checks to make sure the dependencies
-	# for this script are available. The function returns a colon
-	# separated list of states. The format is as follows:
-	#
-	# pos 1: root or not root, that is the question :-)
-	# pos 2: any kind of cron tool found?
-	# pos 3: partitions are mounted and fstype supports TRIM?
-	# pos 4: do all disks support TRIM?
-	# pos 5: Kernel supports TRIM?
-	# pos 6: fstrim available?
+be_sane()
+{
+    # assert that we are root
+    if [[ "${EUID}" != "0" ]] || [[ "${UID}" != "0" ]] ||
+        [[ "${USER}" != "root" ]] || [[ "$(id -u)" != "0" ]]; then
+        printf '%s\n' "Error: you must be root to run this program!"
+        exit 1
+    fi
 
-	# pos1: Are we root?
-	if [ ! -z $USER ]; then
-		[ "$USER" == "root" ] && pos1="root"
-	else
-		find_tool whoami soft
-		if [ ! -z $TOOL ]; then
-			pos1=`${TOOL}`
-		else
-			find_tool who soft
-			[ ! -z $TOOL ] && pos1=`${TOOL} am i|${CUT} -d' ' -f1`
-		fi
-	fi
-	if [ -z $pos1 ] || [ ! "$pos1" == "root" ]; then pos1="nonroot"; fi
+    # check if we have cron
+    if [[ -d /var/spool/cron ]] &&
+        [[ -x /usr/bin/crontab ]] ||
+        [[ -x /bin/crontab ]]; then
+        have_cron=true
+    else
+        have_cron=false
+    fi
 
-	# pos2: cron available?
-	if [ -d /etc/cron.hourly ] && [ -d /etc/cron.daily ] && [ -d /etc/cron.weekly ] && [ -d /etc/cron.monthly ]; then
-		pos2="crondirs"
-	else
-		find_tool crontab soft
-		[ ! -z $TOOL ] && pos2="$TOOL"
-	fi
-	[ -z $pos2 ] && pos2="nocron"
-	
-	# pos3: partitions are mounted and fstype supports TRIM?
-	pos3="supported"
-	lomp="`$MOUNT -t $TRIMMABLE_FS|${TR} [:blank:] :`"
-	for a in $SSD_MOUNT_POINTS;do
-		stat=0
-		for b in $lomp;do
-			curMP="`echo $b|${CUT} -d: -f3`"
-			[ "$curMP" == "$a" ] && stat=1
-		done
-		# If stat is still zero this either means that the partition is not mounted
-		# or it was not on the list, because the partition type was not one of the
-		# filesystems which supports trim.
-		[ $stat -eq 0 ] && pos3="$a"
-	done
+    # assert that mount points support TRIM and disks support TRIM
+    for mp in ${mount_points[*]}; do
+        if [[ ! "${trimmable_fs[*]}" =~ "$(findmnt -M $mp -n -o FSTYPE)" ]]; then
+            printf '%s\n' "Error: mountpoint $mp does not support TRIM."
+            exit 2
+        fi
 
-	# pos4: trim supported by disks?
-	pos4="hwtrim"
-	if [ "$HDPARM_CHECKS" == "true" ];then
-		find_tool hdparm; HDPARM=$TOOL
-		for a in $SSD_MOUNT_POINTS;do
-			stat=0
-			for b in $lomp;do
-				curPN="`echo $b|${CUT} -d: -f1`"
-				curMP="`echo $b|${CUT} -d: -f3`"
-				if [ "$curMP" == "$a" ];then
-					chkdisk="`$HDPARM -I $curPN|$GREP -i trim`"
-					[ ! -z "$chkdisk" ] && stat=1
-				fi
-			done
-			# stat is still zero? Then the disk does not support trim
-			[ $stat -eq 0 ] && pos4="$a"
-		done
-	fi
+        disk="$(findmnt -M $mp -n -o SOURCE)"
+        disk=${disk%%[1-9]*}
+        if ( ! hdparm -I "${disk}" | grep -F -q "TRIM" ); then
+            printf '%s\n' "Error: the disk on $mp does not support TRIM."
+            exit 3
+        fi
+    done
+    unset mp disk
 
-	# pos5: Kernel supports TRIM?
-	# Batched discard through fstrim is available since:
-	#          ext4 - Kernel 2.6.37
-	# ext2,ext3,xfs	- Kernel 2.6.38
-	#         btrfs - Kernel 2.6.39
-	# So as a consensus we check if kernel is at least 2.6.40
-	kv=`$UNAME -r|$SED  -e 's/^\([0-4]\.[.0-9]*\).*$/\1/g'`
-	kmain=`echo $kv|cut -d. -f1`
-	krel=`echo $kv|cut -d. -f2`
-	kmin=`echo $kv|cut -d. -f3`
-	if [ $kmain -ge 3 ];then
-		# We have a third generation Kernel or newer, so TRIM is available.
-		pos5="kernelTRIM"
-	else
-		if [ $kmain -eq 2 ] && [ $krel -eq 6 ] && [ $kmin -ge 40 ]; then
-			pos5="kernelTRIM"
-		fi
-	fi
-	[ -z $pos5 ] && pos5="NOkernelTRIM"
+    # assert that the kernel supports TRIM
+    file="$(mktemp)"
+    echo "2.6.40" > "${file}"
+    kernel="$(uname -r)"
+    kernel=${kernel%%-*}
+    echo "${kernel}" >> "${file}"
+    kern="$(sort -V "${file}" | head -n1)"
+    if [[ "${kern}" != "${kernel}" ]]; then
+        printf '%s\n' "Error: you must be using Linux kernel >= 2.6.40."
+        exit 4
+    fi
+    rm "${file}"
+    unset file kernel kern
 
-	# pos6: fstrim available?
-	find_tool fstrim soft; FSTRIM=$TOOL
-	[ -z $FSTRIM ] && pos6="noFSTRIM" || pos6="$FSTRIM"
-
-	# Now return what we got
-	echo "$pos1:$pos2:$pos3:$pos4:$pos5:$pos6"
-	
-}
-
-find_tool () {
-	# find_tool searches for the overgiven tool in well known places. If the tool
-	# can be found it returns its path. If the tool can not be found the program
-	# exits (since all tools searched with find_tool should be found on every linux
-	# system). Use soft as a second option if you do not want to explicitly exit this
-	# program.
-	tool=$1
-	stat=""
-	for pathes in /usr/sbin /usr/bin /sbin /bin /opt/bin /usr/local/sbin /usr/local/bin; do
-		[ -f ${pathes}/${tool} ] && { stat="${pathes}/${tool}"; break; }
-	done
-	if [ -z $stat ] && [ -z $2 ]; then
-		echo "ERROR: The necessary program $tool has not been found on this system." 1>&2
-		echo "ERROR: This is a critical error, therefore we exit now. Nothing will be" 1>&2
-		echo "ERROR: done, nothing will be trimmed." 1>&2
-		# Okay, we have to exit here. But first do some cleanup before exiting.
-		[ ! -z ${epath} ] && rm -f ${epath}
-		[ ! -z ${MEIMYSELF} ] && rm -f ${MEIMYSELF}
-		kill -s TERM $TOP_PID
-		exit
-	fi
-	TOOL=$stat
+    # assert that we have fstrim
+    if [[ -z "$(command -v fstrim)" ]]; then
+        printf '%s\n' "Error: fstrim must be in $PATH to use this script."
+        exit 5
+    fi
 }
 
 showusage () {
